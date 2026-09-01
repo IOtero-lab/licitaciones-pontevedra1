@@ -41,7 +41,7 @@ jobs:
         # --meses 4  -> descarga lixeira (os 4 últimos meses). Sobe o número
         #               (ou quita --meses para o ano enteiro) se queres máis.
         run: |
-          python scraper.py --saida public --nome-html index.html --meses 4
+          python scraper.py --saida public --nome-html index.html 
 
       - name: Preparar artefacto de Pages
         uses: actions/upload-pages-artifact@v3
