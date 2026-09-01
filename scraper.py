@@ -215,7 +215,7 @@ def descargar(session, url):
     try:
         r = session.get(url, timeout=600, stream=True, verify=False)
         if r.status_code != 200:
-            return None, r.status_code
+            return None, f"HTTP {r.status_code}"
         buf = io.BytesIO()
         total = 0
         for chunk in r.iter_content(chunk_size=1 << 16):
@@ -224,7 +224,13 @@ def descargar(session, url):
                 sys.stdout.write(f"\r    baixando… {total/1e6:.1f} MB")
                 sys.stdout.flush()
         sys.stdout.write("\r")
-        return buf.getvalue(), 200
+        data = buf.getvalue()
+        # Validar que é REALMENTE un zip (firma "PK"). Se PLACSP devolve unha
+        # páxina de erro HTML no canto do zip, isto detéctao e sáltase.
+        if len(data) < 4 or data[:2] != b"PK":
+            cabecera = data[:60].decode("latin-1", "replace").replace("\n", " ")
+            return None, f"resposta non-zip ({len(data)} bytes; empeza por: {cabecera!r})"
+        return data, 200
     except requests.RequestException as e:
         return None, str(e)
 
@@ -276,8 +282,14 @@ def parsear_entry(entry):
 
 
 def iter_entries_zip(data):
-    """Percorre todos os .atom dun zip en memoria e cede cada <entry>."""
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    """Percorre todos os .atom dun zip en memoria e cede cada <entry>.
+    Se o zip está corrupto ou incompleto, non rompe: só avisa e non cede nada."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        log("    ⚠ o ficheiro descargado non é un zip válido. Sáltase.")
+        return
+    with z:
         for nome in z.namelist():
             if not nome.lower().endswith((".atom", ".xml")):
                 continue
@@ -311,74 +323,93 @@ def procesar(args):
     debug_mostradas = 0
     algunha_descarga = False
 
+    # Períodos de reserva (feed anual) por se os mensuais non existen
+    anual = [str(hoxe.year)] + ([str(hoxe.year - 1)] if hoxe.month == 1 else [])
+
+    def procesar_data(data):
+        nonlocal n_entradas, n_abertas, n_pv, debug_mostradas
+        for entry in iter_entries_zip(data):
+            r = parsear_entry(entry)
+            if r is None:
+                continue
+            n_entradas += 1
+
+            # 1) só abertas / en prazo
+            if r["estado_code"] not in ESTADOS_ABERTOS and not args.incluir_todo:
+                continue
+            n_abertas += 1
+
+            # 2) provincia de Pontevedra (NUTS ES114 ou rede de seguridade)
+            nuts = (r["nuts"] or "").upper()
+            if nuts:
+                if nuts != NUTS_PONTEVEDRA:
+                    continue
+            else:
+                if not parece_pontevedra(r["organo"], r["ciudad"], r["objeto"]):
+                    continue
+            n_pv += 1
+
+            if args.debug and debug_mostradas < 3:
+                log("\n    [debug] entry:")
+                for k in ("expediente", "estado", "organo", "ciudad", "nuts",
+                          "objeto", "fecha_pub", "fecha_limite", "importe"):
+                    log(f"        {k}: {r.get(k)}")
+                debug_mostradas += 1
+
+            dlim = parse_data(r["fecha_limite"])
+            dpub = parse_data(r["fecha_pub"])
+
+            # 3) filtro de prazo / antigüidade
+            if dlim:
+                if dlim < hoxe and not args.incluir_todo:
+                    continue
+            else:
+                if dpub and dpub < corte_antigo and not args.incluir_todo:
+                    continue
+
+            ambito = clasificar_ambito(r["organo"], r["ciudad"])
+            rec = {
+                "organismo": r["organo"] or "(órgano non indicado)",
+                "ambito": ambito,
+                "objeto": r["objeto"] or "(sen descrición)",
+                "estado": r["estado"],
+                "importe": (r["importe"] + " €") if r["importe"] else "",
+                "publicado": iso(dpub),
+                "data_limite": iso(dlim),
+                "hora_limite": r["hora_limite"],
+                "expediente": r["expediente"],
+                "url": r["url"] or "https://contrataciondelsectorpublico.gob.es",
+                "_upd": r["updated"] or "",
+            }
+            clave = r["expediente"] or r["url"] or (r["organo"], r["objeto"])
+            anterior = vistos.get(clave)
+            if not anterior or (rec["_upd"] > anterior["_upd"]):
+                vistos[clave] = rec
+
+    def baixar_e_procesar(feed, cfg, per):
+        nonlocal algunha_descarga
+        url = cfg["base"] + cfg["patron"].format(periodo=per)
+        log(f"\n➤ [{feed}] {cfg['patron'].format(periodo=per)}")
+        data, code = descargar(session, url)
+        if data is None:
+            log(f"    ⚠ non dispoñible ({code}). Sáltase.")
+            return False
+        algunha_descarga = True
+        log(f"    ✓ {len(data)/1e6:.1f} MB. Procesando…")
+        procesar_data(data)
+        return True
+
     for feed in feeds:
         cfg = FEEDS[feed]
+        baixou = False
         for per in pers:
-            url = cfg["base"] + cfg["patron"].format(periodo=per)
-            log(f"\n➤ [{feed}] {cfg['patron'].format(periodo=per)}")
-            data, code = descargar(session, url)
-            if data is None:
-                log(f"    ⚠ non dispoñible (HTTP/erro: {code}). Sáltase.")
-                continue
-            algunha_descarga = True
-            log(f"    ✓ {len(data)/1e6:.1f} MB. Procesando…")
-            for entry in iter_entries_zip(data):
-                r = parsear_entry(entry)
-                if r is None:
-                    continue
-                n_entradas += 1
-
-                # 1) só abertas / en prazo
-                if r["estado_code"] not in ESTADOS_ABERTOS and not args.incluir_todo:
-                    continue
-                n_abertas += 1
-
-                # 2) provincia de Pontevedra (NUTS ES114 ou rede de seguridade)
-                nuts = (r["nuts"] or "").upper()
-                if nuts:
-                    if nuts != NUTS_PONTEVEDRA:
-                        continue
-                else:
-                    if not parece_pontevedra(r["organo"], r["ciudad"], r["objeto"]):
-                        continue
-                n_pv += 1
-
-                if args.debug and debug_mostradas < 3:
-                    log("\n    [debug] entry:")
-                    for k in ("expediente", "estado", "organo", "ciudad", "nuts",
-                              "objeto", "fecha_pub", "fecha_limite", "importe"):
-                        log(f"        {k}: {r.get(k)}")
-                    debug_mostradas += 1
-
-                dlim = parse_data(r["fecha_limite"])
-                dpub = parse_data(r["fecha_pub"])
-
-                # 3) filtro de prazo / antigüidade
-                if dlim:
-                    if dlim < hoxe and not args.incluir_todo:
-                        continue
-                else:
-                    if dpub and dpub < corte_antigo and not args.incluir_todo:
-                        continue
-
-                ambito = clasificar_ambito(r["organo"], r["ciudad"])
-                rec = {
-                    "organismo": r["organo"] or "(órgano non indicado)",
-                    "ambito": ambito,
-                    "objeto": r["objeto"] or "(sen descrición)",
-                    "estado": r["estado"],
-                    "importe": (r["importe"] + " €") if r["importe"] else "",
-                    "publicado": iso(dpub),
-                    "data_limite": iso(dlim),
-                    "hora_limite": r["hora_limite"],
-                    "expediente": r["expediente"],
-                    "url": r["url"] or "https://contrataciondelsectorpublico.gob.es",
-                    "_upd": r["updated"] or "",
-                }
-                clave = r["expediente"] or r["url"] or (r["organo"], r["objeto"])
-                anterior = vistos.get(clave)
-                if not anterior or (rec["_upd"] > anterior["_upd"]):
-                    vistos[clave] = rec
+            if baixar_e_procesar(feed, cfg, per):
+                baixou = True
+        # Se estabamos en modo mensual e non se descargou nada, probar co anual
+        if not baixou and args.meses:
+            log(f"    ↪ Ningún mensual dispoñible para [{feed}]; probo co feed anual…")
+            for per in anual:
+                baixar_e_procesar(feed, cfg, per)
 
     todas = list(vistos.values())
     for r in todas:
