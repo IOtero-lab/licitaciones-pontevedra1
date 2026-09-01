@@ -1,0 +1,60 @@
+name: Actualizar licitacións Pontevedra
+
+# Cándo se executa
+on:
+  # 4 veces ao día (hora UTC). En hora galega (verán, UTC+2) son ~07:00, 13:00,
+  # 19:00 e 01:00; en inverno (UTC+1) unha hora menos. Cambia as horas se queres.
+  schedule:
+    - cron: "0 5,11,17,23 * * *"
+  # Botón para lanzar a man dende a pestana "Actions"
+  workflow_dispatch:
+
+# Permisos que necesita GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Que non se solapen dúas actualizacións á vez
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  construir:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar o repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Xerar o panel (últimos meses de PLACSP)
+        # --saida public  -> escribe dentro da carpeta que publica Pages
+        # --nome-html index.html -> Pages serve index.html por defecto
+        # --meses 4  -> descarga lixeira (os 4 últimos meses). Sobe o número
+        #               (ou quita --meses para o ano enteiro) se queres máis.
+        run: |
+          python scraper.py --saida public --nome-html index.html --meses 4
+
+      - name: Preparar artefacto de Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  desplegar:
+    needs: construir
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publicar en GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
