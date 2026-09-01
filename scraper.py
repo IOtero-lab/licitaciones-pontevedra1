@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
 ================================================================================
  LICITACIÓNS ABERTAS · PROVINCIA DE PONTEVEDRA  ·  fonte: PLACSP
  Plataforma de Contratación do Sector Público (estatal)
@@ -621,3 +618,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
