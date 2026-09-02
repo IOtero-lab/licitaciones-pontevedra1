@@ -89,10 +89,20 @@ NS = {
 ESTADOS = {"PRE": "Anuncio previo", "PUB": "En prazo", "EV": "En avaliación",
            "ADJ": "Adxudicada", "RES": "Resolta", "ANUL": "Anulada", "DES": "Deserta"}
 
-# Estados que consideramos "aberta / en prazo"
-ESTADOS_ABERTOS = {"PUB"}
+# En vez de esixir un código concreto de "aberta", excluímos os que están
+# claramente PECHADOS. Así, se PLACSP usa outro código para unha licitación en
+# prazo, non a perdemos (o filtro real de "aberta" faino a data límite).
+# Estados claramente PECHADOS (descártanse). PRE (anuncio previo) trátase á
+# parte, na súa propia pestana.
+ESTADOS_PECHADOS_CODE = {"EV", "ADJ", "RES", "ANUL", "DES"}
+ESTADO_ANUNCIO = "PRE"
 
 NUTS_PONTEVEDRA = "ES114"
+
+# Días que unha licitación permanece na pestana "Novidades" desde que se detecta
+DIAS_NOVIDADE = 3
+# Antigüidade máxima dun anuncio previo para seguir amosándose
+DIAS_ANUNCIO_MAX = 180
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -162,6 +172,18 @@ def parse_data(s):
     return None
 
 def iso(d): return d.isoformat() if isinstance(d, date) else None
+
+def formato_importe(s):
+    """'231264.00' -> '231.264,00 €'  (punto para miles, coma para decimais)."""
+    if s is None or str(s).strip() == "":
+        return ""
+    try:
+        val = float(str(s).strip().replace(",", "."))
+    except ValueError:
+        return str(s)
+    enteiro, dec = f"{val:,.2f}".split(".")     # ex.: '231,264.00' -> '231,264','00'
+    enteiro = enteiro.replace(",", ".")          # miles con punto
+    return f"{enteiro},{dec} €"
 
 
 def clasificar_ambito(organo, ciudad):
@@ -318,26 +340,35 @@ def procesar(args):
     pers = periodos(args, hoxe)
     log(f"➤ Fontes PLACSP: {', '.join(feeds)} · períodos: {', '.join(pers)}")
 
-    vistos = {}          # expediente/url -> rexistro (dedup, quedar co máis novo)
-    n_entradas = n_abertas = n_pv = 0
+    vistos = {}          # clave -> rexistro (dedup)
+    n_entradas = n_pas = n_pv = 0
     debug_mostradas = 0
     algunha_descarga = False
 
+    # Cargar "primeira detección" do JSON xa publicado (para a pestana Novidades)
+    detectado_previo = cargar_detectado_previo(session, getattr(args, "estado_url", None))
+    if detectado_previo:
+        log(f"➤ Cargadas {len(detectado_previo)} datas de primeira detección previas.")
+
     # Períodos de reserva (feed anual) por se os mensuais non existen
     anual = [str(hoxe.year)] + ([str(hoxe.year - 1)] if hoxe.month == 1 else [])
+    limite_anuncio = hoxe - timedelta(days=DIAS_ANUNCIO_MAX)
 
     def procesar_data(data):
-        nonlocal n_entradas, n_abertas, n_pv, debug_mostradas
+        nonlocal n_entradas, n_pas, n_pv, debug_mostradas
         for entry in iter_entries_zip(data):
             r = parsear_entry(entry)
             if r is None:
                 continue
             n_entradas += 1
 
-            # 1) só abertas / en prazo
-            if r["estado_code"] not in ESTADOS_ABERTOS and not args.incluir_todo:
+            code = (r["estado_code"] or "").upper()
+            # 1) descartar as claramente pechadas
+            if code in ESTADOS_PECHADOS_CODE and not args.incluir_todo:
                 continue
-            n_abertas += 1
+            # anuncio previo vai á súa pestana; o resto son "abertas"
+            tipo = "anuncio" if code == ESTADO_ANUNCIO else "aberta"
+            n_pas += 1
 
             # 2) provincia de Pontevedra (NUTS ES114 ou rede de seguridade)
             nuts = (r["nuts"] or "").upper()
@@ -359,32 +390,50 @@ def procesar(args):
             dlim = parse_data(r["fecha_limite"])
             dpub = parse_data(r["fecha_pub"])
 
-            # 3) filtro de prazo / antigüidade
-            if dlim:
-                if dlim < hoxe and not args.incluir_todo:
+            # 3) filtro de prazo / antigüidade segundo o tipo
+            if tipo == "aberta":
+                if dlim:
+                    if dlim < hoxe and not args.incluir_todo:
+                        continue
+                else:
+                    if dpub and dpub < corte_antigo and not args.incluir_todo:
+                        continue
+            else:  # anuncio previo: manter os recentes por data de publicación
+                if dpub and dpub < limite_anuncio and not args.incluir_todo:
                     continue
-            else:
-                if dpub and dpub < corte_antigo and not args.incluir_todo:
-                    continue
+
+            exp = r["expediente"] or r["url"] or ""
+            detectado = detectado_previo.get(exp) or iso(hoxe)
 
             ambito = clasificar_ambito(r["organo"], r["ciudad"])
             rec = {
                 "organismo": r["organo"] or "(órgano non indicado)",
-                "ambito": ambito,
+                "ambito": ambito, "tipo": tipo,
                 "objeto": r["objeto"] or "(sen descrición)",
                 "estado": r["estado"],
-                "importe": (r["importe"] + " €") if r["importe"] else "",
+                "importe": formato_importe(r["importe"]),
                 "publicado": iso(dpub),
                 "data_limite": iso(dlim),
                 "hora_limite": r["hora_limite"],
+                "detectado": detectado,
                 "expediente": r["expediente"],
                 "url": r["url"] or "https://contrataciondelsectorpublico.gob.es",
                 "_upd": r["updated"] or "",
             }
-            clave = r["expediente"] or r["url"] or (r["organo"], r["objeto"])
+            clave = exp or (r["organo"], r["objeto"])
             anterior = vistos.get(clave)
-            if not anterior or (rec["_upd"] > anterior["_upd"]):
+            if anterior is None:
                 vistos[clave] = rec
+            else:
+                # conservar a detección máis temperá
+                rec["detectado"] = min(rec["detectado"], anterior["detectado"])
+                # preferir "aberta" sobre "anuncio"; se igual, o máis recente
+                if anterior["tipo"] == "anuncio" and tipo == "aberta":
+                    vistos[clave] = rec
+                elif anterior["tipo"] == tipo and rec["_upd"] > anterior["_upd"]:
+                    vistos[clave] = rec
+                else:
+                    anterior["detectado"] = rec["detectado"]
 
     def baixar_e_procesar(feed, cfg, per):
         nonlocal algunha_descarga
@@ -405,7 +454,6 @@ def procesar(args):
         for per in pers:
             if baixar_e_procesar(feed, cfg, per):
                 baixou = True
-        # Se estabamos en modo mensual e non se descargou nada, probar co anual
         if not baixou and args.meses:
             log(f"    ↪ Ningún mensual dispoñible para [{feed}]; probo co feed anual…")
             for per in anual:
@@ -416,9 +464,32 @@ def procesar(args):
         r.pop("_upd", None)
     todas.sort(key=lambda r: r.get("publicado") or "", reverse=True)
 
-    log(f"\n\n➤ Resumo: {n_entradas:,} entradas · {n_abertas:,} abertas · "
-        f"{n_pv:,} en Pontevedra · {len(todas):,} tras filtrar prazo/antigüidade.")
+    n_ab = sum(1 for r in todas if r["tipo"] == "aberta")
+    n_an = sum(1 for r in todas if r["tipo"] == "anuncio")
+    log(f"\n\n➤ Resumo: {n_entradas:,} entradas · {n_pas:,} non pechadas · "
+        f"{n_pv:,} en Pontevedra · {n_ab:,} abertas + {n_an:,} anuncios previos.")
     return todas, algunha_descarga
+
+
+def cargar_detectado_previo(session, url):
+    """Le o JSON xa publicado para saber cándo se detectou cada expediente."""
+    if not url:
+        return {}
+    try:
+        r = session.get(url, timeout=30, verify=False)
+        if r.status_code != 200:
+            return {}
+        datos = r.json()
+    except Exception:
+        return {}
+    out = {}
+    if isinstance(datos, list):
+        for rec in datos:
+            exp = rec.get("expediente") or rec.get("url")
+            det = rec.get("detectado")
+            if exp and det:
+                out[exp] = det
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -426,8 +497,8 @@ def procesar(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def gardar_csv(recs, ruta):
-    campos = ["organismo", "ambito", "objeto", "estado", "importe",
-              "publicado", "data_limite", "expediente", "url"]
+    campos = ["tipo", "organismo", "ambito", "objeto", "estado", "importe",
+              "publicado", "data_limite", "detectado", "expediente", "url"]
     with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=campos, extrasaction="ignore")
         w.writeheader()
@@ -478,6 +549,9 @@ PANEL_TEMPLATE = r"""<!DOCTYPE html>
   .org{font-size:12.5px;color:var(--mar);font-weight:700;margin-bottom:3px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .tag{font-size:10.5px;font-weight:700;padding:1px 7px;border-radius:999px;background:var(--area);color:var(--mar2)}
   .tag.x{background:#e3edf7;color:var(--xunta)} .tag.o{background:#eee;color:#666}
+  .tag.nova{background:#e2f0e6;color:#1f7a44}
+  .card.anuncio{border-left-color:var(--dourado)}
+  .pill.anuncio{background:#f3eede;color:var(--dourado)}
   .obj{font-size:15px;color:var(--tinta);margin:2px 0 10px}
   .meta{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--gris);align-items:center}
   .meta b{color:var(--tinta);font-weight:600}
@@ -492,22 +566,27 @@ PANEL_TEMPLATE = r"""<!DOCTYPE html>
 <header><div class="cab">
   <h1>Licitacións abertas · provincia de Pontevedra</h1>
   <p>Fonte: PLACSP (perfís estatais + agregación CCAA) · actualizado o __XERADO__ ·
-     inclúe Concello de Vigo, Deputación e entes da Xunta con execución en Pontevedra ·
+     inclúe todos os organismos que poden licitar na provincia de Pontevedra ·
      as fóra de prazo e antigas ocúltanse soas</p>
 </div></header>
 <div class="barra">
   <div class="tabs">
     <button class="tab on" data-v="dia">Todas por día</button>
+    <button class="tab" data-v="novidades">Novidades</button>
     <button class="tab" data-v="cinco">Últimos 5 días</button>
+    <button class="tab" data-v="anuncios">Anuncios previos</button>
   </div>
   <label class="busca">🔎 <input id="q" type="text" placeholder="Busca por organismo (p.ex. Vigo) ou texto…"></label>
   <span class="conta" id="conta"></span>
 </div>
 <main id="saida"></main>
 <footer>Xerado localmente a partir dos datos abertos de PLACSP (Ministerio de Facenda).
-  Verifica sempre o prazo na ficha oficial antes de presentar unha oferta.</footer>
+  "Novidades" mostra as detectadas nos últimos 3 días. "Anuncios previos" son avisos
+  anteriores á apertura, para ir preparando o orzamento. Verifica sempre o prazo na
+  ficha oficial antes de presentar unha oferta.</footer>
 <script>
 const DATOS=__DATOS__;
+const DIAS_NOVIDADE=3;
 const hoxe=new Date(); hoxe.setHours(0,0,0,0);
 const MESES=["xaneiro","febreiro","marzo","abril","maio","xuño","xullo","agosto","setembro","outubro","novembro","decembro"];
 let vista="dia";
@@ -515,40 +594,66 @@ function d(i){if(!i)return null;const p=i.split("-");return new Date(+p[0],+p[1]
 function fmt(i){const x=d(i);return x?x.getDate()+" "+MESES[x.getMonth()]+" "+x.getFullYear():"—";}
 function dias(i){const x=d(i);return x?Math.round((x-hoxe)/86400000):null;}
 function vixente(r){const dl=d(r.data_limite);return (!dl)||(dl>=hoxe);}
+function novo(r){const t=dias(r.detectado);return t!==null&&t<=0&&t>-DIAS_NOVIDADE;}
+function esc(s){return (s||"").replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
 function filtra(){
   const q=document.getElementById("q").value.trim().toLowerCase();
-  let b=DATOS.filter(vixente);
-  if(vista==="cinco"){const l=new Date(hoxe);l.setDate(l.getDate()-5);
-    b=b.filter(r=>{const p=d(r.publicado);return p&&p>=l&&p<=hoxe;});}
+  let b;
+  if(vista==="anuncios"){
+    b=DATOS.filter(r=>r.tipo==="anuncio");
+  }else{
+    b=DATOS.filter(r=>r.tipo==="aberta"&&vixente(r));
+    if(vista==="cinco"){const l=new Date(hoxe);l.setDate(l.getDate()-5);
+      b=b.filter(r=>{const p=d(r.publicado);return p&&p>=l&&p<=hoxe;});}
+    if(vista==="novidades"){b=b.filter(novo);}
+  }
   if(q)b=b.filter(r=>(r.organismo||"").toLowerCase().includes(q)||(r.objeto||"").toLowerCase().includes(q));
   return b;
 }
-function esc(s){return (s||"").replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
 function tarxeta(r){
-  const rest=dias(r.data_limite),urxe=rest!==null&&rest<=5&&rest>=0;
+  const anuncio=r.tipo==="anuncio";
+  const rest=dias(r.data_limite),urxe=!anuncio&&rest!==null&&rest<=5&&rest>=0;
   const ax=r.ambito==="xunta";
   let tag=r.ambito==="local"?'<span class="tag">Local</span>':ax?'<span class="tag x">Xunta</span>':'<span class="tag o">Outros</span>';
+  if(novo(r)&&!anuncio)tag+='<span class="tag nova">nova</span>';
   let pill;
-  if(r.data_limite===null)pill='<span class="pill sendata">sen data de peche</span>';
+  if(anuncio)pill='<span class="pill anuncio">anuncio previo</span>';
+  else if(r.data_limite===null)pill='<span class="pill sendata">sen data de peche</span>';
   else if(rest===0)pill='<span class="pill urxe">pecha hoxe</span>';
   else if(rest<0)pill='';
   else pill='<span class="pill'+(urxe?' urxe':'')+'">'+rest+' día'+(rest===1?'':'s')+' restantes</span>';
   const imp=r.importe?'<span>Importe: <b>'+esc(r.importe)+'</b></span>':'';
-  return '<div class="card'+(urxe?' urxe':'')+(ax?' axunta':'')+'">'
+  const limite=anuncio?'':'<span>Data límite: <b>'+fmt(r.data_limite)+'</b></span>';
+  return '<div class="card'+(urxe?' urxe':'')+(anuncio?' anuncio':(ax?' axunta':''))+'">'
     +'<div class="org">'+tag+esc(r.organismo)+'</div>'
     +'<div class="obj">'+esc(r.objeto)+'</div>'
     +'<div class="meta"><span>Publicado: <b>'+fmt(r.publicado)+'</b></span>'
-    +'<span>Data límite: <b>'+fmt(r.data_limite)+'</b></span>'+imp+pill
+    +limite+imp+pill
     +'<a href="'+esc(r.url)+'" target="_blank" rel="noopener">Ver ficha ↗</a></div></div>';
 }
+
 function pinta(){
   const l=filtra(),c=document.getElementById("saida");
-  document.getElementById("conta").textContent=l.length+(l.length===1?" licitación aberta":" licitacións abertas");
-  if(!l.length){c.innerHTML='<div class="baleiro">Non hai licitacións abertas que coincidan.<br>Proba a borrar o buscador ou cambiar de pestana.</div>';return;}
-  const g={};l.forEach(r=>{const k=r.publicado||"0000";(g[k]=g[k]||[]).push(r);});
+  let etiqueta;
+  if(vista==="anuncios")etiqueta=l.length===1?" anuncio previo":" anuncios previos";
+  else if(vista==="novidades")etiqueta=l.length===1?" novidade":" novidades";
+  else etiqueta=l.length===1?" licitación aberta":" licitacións abertas";
+  document.getElementById("conta").textContent=l.length+etiqueta;
+  if(!l.length){
+    let m="Non hai nada que coincida.";
+    if(vista==="novidades")m="Sen novidades nos últimos 3 días.";
+    if(vista==="anuncios")m="Non hai anuncios previos agora mesmo.";
+    c.innerHTML='<div class="baleiro">'+m+'<br>Proba a borrar o buscador ou cambiar de pestana.</div>';return;
+  }
+  // agrupar: por detección en "Novidades"; por publicación no resto
+  const porDeteccion=(vista==="novidades");
+  const g={};l.forEach(r=>{const k=(porDeteccion?r.detectado:r.publicado)||"0000";(g[k]=g[k]||[]).push(r);});
   let out="";Object.keys(g).sort().reverse().forEach(k=>{const gr=g[k];
-    out+='<section class="dia"><h2>'+(k==="0000"?"Sen data de publicación":fmt(k))
-      +'<span>'+gr.length+' licitación'+(gr.length===1?'':'s')+'</span></h2>';
+    const cab=(k==="0000")?(porDeteccion?"Sen data":"Sen data de publicación"):(porDeteccion?"Detectadas o "+fmt(k):fmt(k));
+    out+='<section class="dia"><h2>'+cab
+      +'<span>'+gr.length+'</span></h2>';
     gr.forEach(r=>out+=tarxeta(r));out+='</section>';});
   c.innerHTML=out;
 }
@@ -581,6 +686,9 @@ def main():
                          "En GitHub Actions úsase 'public'.")
     ap.add_argument("--nome-html", default="dashboard.html",
                     help="Nome do HTML xerado (def. dashboard.html; en Pages: index.html)")
+    ap.add_argument("--estado-url", default=None,
+                    help="URL do JSON xa publicado (para lembrar a data de primeira "
+                         "detección de cada licitación e alimentar a pestana Novidades)")
     ap.add_argument("--abrir", action="store_true")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
