@@ -205,12 +205,20 @@ def clasificar_ambito(organo, ciudad):
 
 
 def parece_pontevedra(organo, ciudad, objeto):
-    """Rede de seguridade cando falta o NUTS."""
-    blob = " ".join(sen_acentos(x) for x in (organo, ciudad, objeto) if x)
-    if "pontevedra" in blob:
+    """Rede de seguridade cando o NUTS falta ou é ambiguo.
+    No órgano/localidade admítese calquera concello (mesmo curtos como 'Vigo',
+    'Mos', 'Tui'); no obxecto (texto libre) só nomes longos, para evitar falsos."""
+    oc = " ".join(sen_acentos(x) for x in (organo, ciudad) if x)
+    if "pontevedra" in oc:
         return True
     for mun in _MUN_NORM:
-        if len(mun) >= 5 and re.search(rf"\b{re.escape(mun)}\b", blob):
+        if mun and re.search(rf"\b{re.escape(mun)}\b", oc):
+            return True
+    ob = sen_acentos(objeto or "")
+    if "pontevedra" in ob:
+        return True
+    for mun in _MUN_NORM:
+        if len(mun) >= 6 and re.search(rf"\b{re.escape(mun)}\b", ob):
             return True
     return False
 
@@ -370,14 +378,23 @@ def procesar(args):
             tipo = "anuncio" if code == ESTADO_ANUNCIO else "aberta"
             n_pas += 1
 
-            # 2) provincia de Pontevedra (NUTS ES114 ou rede de seguridade)
-            nuts = (r["nuts"] or "").upper()
-            if nuts:
-                if nuts != NUTS_PONTEVEDRA:
-                    continue
+            # 2) provincia de Pontevedra. Regras:
+            #    · ES114            -> Pontevedra (incluír)
+            #    · ES111/112/113 ou outra provincia concreta -> descartar
+            #    · ES11 (Galicia sen precisar) ou sen NUTS   -> rede de seguridade
+            nuts = (r["nuts"] or "").upper().replace(" ", "")
+            if nuts.startswith("ES114"):
+                en_pv = True
+            elif nuts[:5] in ("ES111", "ES112", "ES113"):
+                en_pv = False                      # A Coruña, Lugo, Ourense
+            elif nuts.startswith("ES11"):
+                en_pv = parece_pontevedra(r["organo"], r["ciudad"], r["objeto"])
+            elif nuts.startswith("ES") and len(nuts) >= 5:
+                en_pv = False                      # provincia doutra CCAA
             else:
-                if not parece_pontevedra(r["organo"], r["ciudad"], r["objeto"]):
-                    continue
+                en_pv = parece_pontevedra(r["organo"], r["ciudad"], r["objeto"])
+            if not en_pv:
+                continue
             n_pv += 1
 
             if args.debug and debug_mostradas < 3:
