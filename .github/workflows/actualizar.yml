@@ -35,13 +35,17 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Xerar o panel (últimos meses de PLACSP)
+      - name: Xerar o panel (ano en curso de PLACSP)
         # --saida public  -> escribe dentro da carpeta que publica Pages
         # --nome-html index.html -> Pages serve index.html por defecto
-        # --meses 4  -> descarga lixeira (os 4 últimos meses). Sobe o número
-        #               (ou quita --meses para o ano enteiro) se queres máis.
+        # --estado-url -> le o JSON xa publicado para lembrar cándo se detectou
+        #                 cada licitación (alimenta a pestana "Novidades").
         run: |
-          python scraper.py --saida public --nome-html index.html 
+          OWNER=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          REPO="${GITHUB_REPOSITORY##*/}"
+          URL="https://${OWNER}.github.io/${REPO}/licitacions_pontevedra.json"
+          echo "Estado previo desde: $URL"
+          python scraper.py --saida public --nome-html index.html --estado-url "$URL"
 
       - name: Preparar artefacto de Pages
         uses: actions/upload-pages-artifact@v3
