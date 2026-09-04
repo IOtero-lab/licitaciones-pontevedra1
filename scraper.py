@@ -241,28 +241,45 @@ def periodos(args, hoxe):
         outs.append(str(hoxe.year - 1))
     return outs
 
-def descargar(session, url):
-    try:
-        r = session.get(url, timeout=600, stream=True, verify=False)
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
-        buf = io.BytesIO()
-        total = 0
-        for chunk in r.iter_content(chunk_size=1 << 16):
-            if chunk:
-                buf.write(chunk); total += len(chunk)
-                sys.stdout.write(f"\r    baixando… {total/1e6:.1f} MB")
-                sys.stdout.flush()
-        sys.stdout.write("\r")
-        data = buf.getvalue()
-        # Validar que é REALMENTE un zip (firma "PK"). Se PLACSP devolve unha
-        # páxina de erro HTML no canto do zip, isto detéctao e sáltase.
-        if len(data) < 4 or data[:2] != b"PK":
-            cabecera = data[:60].decode("latin-1", "replace").replace("\n", " ")
-            return None, f"resposta non-zip ({len(data)} bytes; empeza por: {cabecera!r})"
-        return data, 200
-    except requests.RequestException as e:
-        return None, str(e)
+def descargar(session, url, intentos=4):
+    """Descarga cun ZIP validado. Reintenta con backoff se PLACSP corta a
+    conexión ou vai lento: o feed 1044 son 100+ MB e adoita dar timeout, e ata
+    agora un único fallo tumbaba todo o feed (deixando p.ex. a Xunta a cero)."""
+    ult_erro = "?"
+    for intento in range(1, intentos + 1):
+        try:
+            # (connect, read): corta rápido se non conecta; tolera streams lentos.
+            r = session.get(url, timeout=(30, 600), stream=True, verify=False)
+            if r.status_code != 200:
+                ult_erro = f"HTTP {r.status_code}"
+                if 400 <= r.status_code < 500:
+                    return None, ult_erro          # erro do cliente: non insistir
+                raise requests.RequestException(ult_erro)
+            buf = io.BytesIO()
+            total = 0
+            for chunk in r.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    buf.write(chunk); total += len(chunk)
+                    sys.stdout.write(f"\r    baixando… {total/1e6:.1f} MB")
+                    sys.stdout.flush()
+            sys.stdout.write("\r")
+            data = buf.getvalue()
+            # Validar que é REALMENTE un zip (firma "PK"). Se PLACSP devolve unha
+            # páxina de erro HTML no canto do zip, isto detéctao.
+            if len(data) < 4 or data[:2] != b"PK":
+                cabecera = data[:60].decode("latin-1", "replace").replace("\n", " ")
+                ult_erro = f"resposta non-zip ({len(data)} bytes; empeza por: {cabecera!r})"
+                raise requests.RequestException(ult_erro)
+            return data, 200
+        except requests.RequestException as e:
+            ult_erro = str(e)
+            if intento < intentos:
+                espera = 20 * intento              # 20s, 40s, 60s…
+                sys.stdout.write("\r")
+                log(f"    ↻ intento {intento}/{intentos} fallou ({ult_erro}). "
+                    f"Reintento en {espera}s…")
+                time.sleep(espera)
+    return None, ult_erro
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -465,6 +482,7 @@ def procesar(args):
         procesar_data(data)
         return True
 
+    feeds_fallidos = []
     for feed in feeds:
         cfg = FEEDS[feed]
         baixou = False
@@ -474,7 +492,10 @@ def procesar(args):
         if not baixou and args.meses:
             log(f"    ↪ Ningún mensual dispoñible para [{feed}]; probo co feed anual…")
             for per in anual:
-                baixar_e_procesar(feed, cfg, per)
+                if baixar_e_procesar(feed, cfg, per):
+                    baixou = True
+        if not baixou:
+            feeds_fallidos.append(feed)
 
     todas = list(vistos.values())
     for r in todas:
@@ -485,7 +506,7 @@ def procesar(args):
     n_an = sum(1 for r in todas if r["tipo"] == "anuncio")
     log(f"\n\n➤ Resumo: {n_entradas:,} entradas · {n_pas:,} non pechadas · "
         f"{n_pv:,} en Pontevedra · {n_ab:,} abertas + {n_an:,} anuncios previos.")
-    return todas, algunha_descarga
+    return todas, algunha_descarga, feeds_fallidos
 
 
 def cargar_detectado_previo(session, url):
@@ -698,6 +719,9 @@ def main():
                     help="Usar só un feed (643=perfís PLACSP, 1044=agregadas CCAA)")
     ap.add_argument("--incluir-todo", action="store_true",
                     help="Non filtrar por estado/prazo (depuración)")
+    ap.add_argument("--permitir-parcial", action="store_true",
+                    help="Rexenerar o panel aínda que falle algún feed (por defecto, "
+                         "se falla un feed non se rexenera para non degradar o sitio).")
     ap.add_argument("--saida", default=".",
                     help="Carpeta onde gardar os ficheiros (def. actual). "
                          "En GitHub Actions úsase 'public'.")
@@ -710,13 +734,23 @@ def main():
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    todas, algunha_descarga = procesar(args)
+    todas, algunha_descarga, feeds_fallidos = procesar(args)
 
     # Rede de seguridade para o modo aloxado (GitHub Actions):
     # se NON se descargou ningún feed, non sobreescribas o panel bo anterior.
     if not algunha_descarga:
         log("\n✗ Non se puido descargar ningún feed de PLACSP. "
             "Non se rexenera o panel (consérvase o anterior).")
+        sys.exit(1)
+
+    # Se algún feed solicitado FALLOU (o típico: o 1044 dá timeout), non despregues
+    # un panel degradado —deixaría a Xunta a cero e faría desaparecer os concellos
+    # que publican polo portal galego (Vigo, Tui…)—. Mantense a versión boa anterior.
+    # Con --permitir-parcial fórzase a rexeneración co que si baixou.
+    if feeds_fallidos and not args.permitir_parcial:
+        log(f"\n✗ Non se descargou o feed: {', '.join(feeds_fallidos)}. "
+            "Para non degradar o panel, NON se rexenera (consérvase o anterior). "
+            "Usa --permitir-parcial para forzar co que si baixou.")
         sys.exit(1)
 
     os.makedirs(args.saida, exist_ok=True)
